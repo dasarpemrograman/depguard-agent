@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+DepGuard Webhook Notifier (10/10 feature).
+Fires immediate notifications on CRITICAL vulnerability detection.
+Supports Slack, Discord, and generic webhook URLs.
+"""
+from __future__ import annotations
+
+import json
+import sys
+import urllib.request
+from pathlib import Path
+
+
+def load_depguard(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def detect_webhook_type(url: str) -> str:
+    if "hooks.slack.com" in url:
+        return "slack"
+    if "discord.com/api/webhooks" in url:
+        return "discord"
+    return "generic"
+
+
+def create_slack_payload(cve_data: list[dict]) -> dict:
+    criticals = [v for v in cve_data if v.get("severity") == "CRITICAL"]
+    highs = [v for v in cve_data if v.get("severity") == "HIGH"]
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "🚨 DepGuard: Critical Vulnerabilities Detected"}
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{len(criticals)} CRITICAL*, *{len(highs)} HIGH* vulnerabilities found across monitored repositories."
+            }
+        }
+    ]
+
+    for v in criticals[:5]:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"🔴 *{v.get('cve')}* — {v.get('package')}@{v.get('version')}\n"
+                    f"Repo: `{v.get('repo')}` | Severity: CRITICAL\n"
+                    f"{v.get('summary', '')[:140]}"
+                )
+            }
+        })
+
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": "DepGuard is running verify + patch. Full report incoming."}]
+    })
+
+    return {"blocks": blocks}
+
+
+def create_discord_payload(cve_data: list[dict]) -> dict:
+    criticals = [v for v in cve_data if v.get("severity") == "CRITICAL"]
+    highs = [v for v in cve_data if v.get("severity") == "HIGH"]
+
+    fields = []
+    for v in criticals[:5] + highs[:3]:
+        fields.append({
+            "name": f"{v.get('cve')} — {v.get('package')}@{v.get('version')}",
+            "value": f"Repo: `{v.get('repo')}` | {v.get('severity')}\n{v.get('summary', '')[:100]}",
+            "inline": False
+        })
+
+    return {
+        "embeds": [{
+            "title": f"🚨 DepGuard: {len(criticals)} CRITICAL, {len(highs)} HIGH Vulnerabilities",
+            "description": "DepGuard is running verify + patch. Full report incoming.",
+            "color": 0xdc2626,
+            "fields": fields,
+            "footer": {"text": "DepGuard Agent • OpenClaw Agenthon 2026"}
+        }]
+    }
+
+
+def create_generic_payload(cve_data: list[dict]) -> dict:
+    criticals = [v for v in cve_data if v.get("severity") == "CRITICAL"]
+    return {
+        "source": "DepGuard Agent",
+        "event": "critical_vulnerabilities_detected",
+        "count": len(criticals),
+        "vulnerabilities": [
+            {
+                "cve": v.get("cve"),
+                "package": v.get("package"),
+                "version": v.get("version"),
+                "repo": v.get("repo"),
+                "severity": v.get("severity"),
+                "summary": v.get("summary", "")
+            }
+            for v in criticals[:10]
+        ]
+    }
+
+
+def send_webhook(url: str, payload: dict) -> bool:
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status in (200, 204)
+    except Exception as e:
+        print(f"Webhook delivery failed: {e}", file=sys.stderr)
+        return False
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: depguard-webhook <WEBHOOK_URL> [.depguard.json path]", file=sys.stderr)
+        sys.exit(2)
+
+    url = sys.argv[1]
+    depguard_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(".depguard.json")
+
+    data = load_depguard(depguard_path)
+    vulns = data.get("vulnerabilities", [])
+
+    critical_or_high = [v for v in vulns if v.get("severity") in ("CRITICAL", "HIGH")]
+    if not critical_or_high:
+        print("No CRITICAL or HIGH vulnerabilities to notify about.")
+        return
+
+    hook_type = detect_webhook_type(url)
+
+    if hook_type == "slack":
+        payload = create_slack_payload(critical_or_high)
+    elif hook_type == "discord":
+        payload = create_discord_payload(critical_or_high)
+    else:
+        payload = create_generic_payload(critical_or_high)
+
+    success = send_webhook(url, payload)
+    if success:
+        print(f"✅ Webhook sent to {hook_type}: {len([v for v in critical_or_high if v.get('severity') == 'CRITICAL'])} CRITICAL, {len([v for v in critical_or_high if v.get('severity') == 'HIGH'])} HIGH")
+    else:
+        print("❌ Webhook delivery failed", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

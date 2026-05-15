@@ -1,0 +1,31 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_FILE="${DEPGUARD_CONFIG:-${HOME}/.hermes/depguard-config.yaml}"
+SELECT_MODEL="${DEPGUARD_SELECT_MODEL:-${HOME}/.hermes/bin/select-model.sh}"
+
+if [ ! -x "$SELECT_MODEL" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  SELECT_MODEL="${SCRIPT_DIR}/select-model.sh"
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  REPO_CONFIG="$(cd "${SCRIPT_DIR}/.." && pwd)/config.yaml"
+  if [ -f "$REPO_CONFIG" ]; then
+    CONFIG_FILE="$REPO_CONFIG"
+  else
+    echo "Error: DepGuard config not found. Set DEPGUARD_CONFIG or reinstall DepGuard." >&2
+    exit 1
+  fi
+fi
+
+MODEL="$("$SELECT_MODEL")"
+MAX_TURNS="$(awk '/max_turns:/ {print $2; exit}' "$CONFIG_FILE")"
+MAX_TURNS="${MAX_TURNS:-120}"
+exec hermes chat \
+  --provider openrouter \
+  --model "$MODEL" \
+  --toolsets terminal,web,file,browser \
+  --max-turns "$MAX_TURNS" \
+  "$@"

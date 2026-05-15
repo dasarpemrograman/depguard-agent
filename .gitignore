@@ -1,0 +1,10 @@
+# DepGuard Agent
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.log
+.hermes/
+depguard-model.txt
+.depguard.json

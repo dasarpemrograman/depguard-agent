@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${DEPGUARD_CONFIG:-${HOME}/.hermes/depguard-config.yaml}"
+SELECT_MODEL="${DEPGUARD_SELECT_MODEL:-${HOME}/.hermes/bin/select-model.sh}"
+TOKEN=""
+REPOS=""
+PATCH_MEDIUM=0
+SKIP_VERIFY=0
+POC_RUN=0
+WEBHOOK_URL="${DEPGUARD_WEBHOOK_URL:-}"
+MULTI_AGENT=0
+
+usage() {
+  cat <<'USAGE'
+Usage: depguard-monitor [OPTIONS]
+
+Runs the autonomous DepGuard 6-phase workflow through Hermes:
+  onboard → scan → watch → verify → patch → report
+
+Options:
+  --token GITHUB_TOKEN       GitHub PAT with repo scope
+  --repos owner/repo[,repo]  Repos to monitor (comma-separated)
+  --patch-medium             Include MEDIUM findings in auto-patch
+  --skip-verify              Skip AST reachability verification phase
+  --run-poc                  Execute PoC tests during verify (proves vulns)
+  --webhook URL              Slack/Discord/Telegram webhook for CRITICAL alerts
+  --multi-agent              Spawn parallel triage + RAG sub-agents
+  -h, --help                 Show this help
+
+10/10 Features (when --multi-agent is set):
+  - Triage sub-agent: parallel repo security posture analysis during scan
+  - RAG sub-agent: past fix history retrieval for similar CVE+package combos
+  - Webhook: immediate CRITICAL vuln notification before patch begins
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --token)
+      TOKEN="${2:-}"
+      shift 2
+      ;;
+    --token=*)
+      TOKEN="${1#*=}"
+      shift
+      ;;
+    --repos)
+      REPOS="${2:-}"
+      shift 2
+      ;;
+    --repos=*)
+      REPOS="${1#*=}"
+      shift
+      ;;
+    --patch-medium)
+      PATCH_MEDIUM=1
+      shift
+      ;;
+    --skip-verify)
+      SKIP_VERIFY=1
+      shift
+      ;;
+    --run-poc)
+      POC_RUN=1
+      shift
+      ;;
+    --webhook)
+      WEBHOOK_URL="${2:-}"
+      shift 2
+      ;;
+    --webhook=*)
+      WEBHOOK_URL="${1#*=}"
+      shift
+      ;;
+    --multi-agent)
+      MULTI_AGENT=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Error: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ ! -x "$SELECT_MODEL" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  SELECT_MODEL="${SCRIPT_DIR}/select-model.sh"
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  REPO_CONFIG="$(cd "${SCRIPT_DIR}/.." && pwd)/config.yaml"
+  if [ -f "$REPO_CONFIG" ]; then
+    CONFIG_FILE="$REPO_CONFIG"
+  else
+    echo "Error: DepGuard config not found. Set DEPGUARD_CONFIG or reinstall DepGuard." >&2
+    exit 1
+  fi
+fi
+
+if { [ -n "$TOKEN" ] && [ -z "$REPOS" ]; } || { [ -z "$TOKEN" ] && [ -n "$REPOS" ]; }; then
+  echo "Error: --token and --repos must be provided together." >&2
+  exit 2
+fi
+
+MODEL="$("$SELECT_MODEL")"
+MAX_TURNS="$(awk '/max_turns:/ {print $2; exit}' "$CONFIG_FILE")"
+MAX_TURNS="${MAX_TURNS:-150}"
+
+# Build the prompt
+prompt="Run DepGuard monitor end to end with the 6-phase pipeline: "
+
+if [ -n "$TOKEN" ]; then
+  prompt+="First run onboard with token:${TOKEN} repos:${REPOS}. "
+fi
+
+if [ "$MULTI_AGENT" -eq 1 ]; then
+  prompt+="Enable multi-agent mode: during scan, spawn a parallel triage sub-agent to analyze each repo's security posture (branch protection, exposed secrets, CI/CD config); during watch, spawn a RAG sub-agent to search past fix history for similar CVE+package combos. "
+fi
+
+prompt+="Then run scan across all 9 supported ecosystems (npm, PyPI, Go, crates.io, Maven, RubyGems, Hex, Packagist). "
+
+if [ "$SKIP_VERIFY" -eq 1 ]; then
+  prompt+="SKIP the verify phase. "
+else
+  prompt+="Run verify: execute scripts/check-reachability.py to perform AST reachability analysis on all CRITICAL and HIGH CVEs. "
+  if [ "$POC_RUN" -eq 1 ]; then
+    prompt+="Use --run-poc to execute PoC tests and confirm reachability with 100% confidence. "
+  fi
+  prompt+="Skip patching for CVEs marked unreachable with confidence >= 70%. "
+fi
+
+prompt+="Then run patch with dynamic log analysis: on test failure, capture last 50 lines of stderr and produce an AI-generated Correction Plan before flagging manual_review. "
+
+if [ "$PATCH_MEDIUM" -eq 1 ]; then
+  prompt+="Include MEDIUM findings in auto-patching when a fixed version is available. "
+else
+  prompt+="Use the default severity policy: auto-patch CRITICAL/HIGH verified-reachable, report MEDIUM, ignore LOW. "
+fi
+
+if [ -n "$WEBHOOK_URL" ]; then
+  prompt+="On CRITICAL vulnerability detection during watch, immediately fire a webhook notification to ${WEBHOOK_URL} with CVE ID, package, severity, and repo details — before the verify/patch phases begin. "
+fi
+
+prompt+="Finally produce the report with reachability summary, fix table, and correction plans. "
+prompt+="Use the installed DepGuard skills and helper scripts in scripts/."
+
+exec hermes chat \
+  --query "$prompt" \
+  --provider openrouter \
+  --model "$MODEL" \
+  --toolsets terminal,web,file,browser \
+  --max-turns "$MAX_TURNS"

@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: depguard-github-advisories --ecosystem ECOSYSTEM --package NAME
+
+ECOSYSTEM must be a GitHub SecurityAdvisoryEcosystem value, for example:
+NPM, PIP, GO, RUST, MAVEN, RUBYGEMS, COMPOSER.
+USAGE
+}
+
+ECOSYSTEM=""
+PACKAGE=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --ecosystem)
+      ECOSYSTEM="${2:-}"
+      shift 2
+      ;;
+    --ecosystem=*)
+      ECOSYSTEM="${1#*=}"
+      shift
+      ;;
+    --package)
+      PACKAGE="${2:-}"
+      shift 2
+      ;;
+    --package=*)
+      PACKAGE="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Error: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$ECOSYSTEM" ] || [ -z "$PACKAGE" ]; then
+  usage >&2
+  exit 2
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "Error: gh is required for GitHub Advisory queries." >&2
+  exit 127
+fi
+
+QUERY='
+query($package: String!, $eco: SecurityAdvisoryEcosystem!, $cursor: String) {
+  securityVulnerabilities(first: 100, after: $cursor, ecosystem: $eco, package: $package) {
+    nodes {
+      severity
+      advisory {
+        summary
+        description
+        identifiers { type value }
+        publishedAt
+      }
+      vulnerableVersionRange
+      firstPatchedVersion { identifier }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+'
+
+cursor=""
+first_page=1
+printf '['
+while :; do
+  if [ -n "$cursor" ]; then
+    page="$(gh api graphql -f query="$QUERY" -f package="$PACKAGE" -f eco="$ECOSYSTEM" -f cursor="$cursor")"
+  else
+    page="$(gh api graphql -f query="$QUERY" -f package="$PACKAGE" -f eco="$ECOSYSTEM")"
+  fi
+
+  PAGE="$page" FIRST_PAGE="$first_page" python3 - <<'PY'
+import json
+import os
+
+data = json.loads(os.environ["PAGE"])
+nodes = data["data"]["securityVulnerabilities"]["nodes"]
+first_page = os.environ["FIRST_PAGE"] == "1"
+for index, node in enumerate(nodes):
+    if not first_page or index:
+        print(",", end="")
+    print(json.dumps(node, sort_keys=True), end="")
+PY
+
+  first_page=0
+  has_next="$(PAGE="$page" python3 - <<'PY'
+import json
+import os
+
+page_info = json.loads(os.environ["PAGE"])["data"]["securityVulnerabilities"]["pageInfo"]
+print("1" if page_info["hasNextPage"] else "0")
+PY
+)"
+  if [ "$has_next" != "1" ]; then
+    break
+  fi
+  cursor="$(PAGE="$page" python3 - <<'PY'
+import json
+import os
+
+print(json.loads(os.environ["PAGE"])["data"]["securityVulnerabilities"]["pageInfo"]["endCursor"] or "")
+PY
+)"
+done
+printf ']\n'

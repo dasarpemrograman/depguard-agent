@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Query OSV.dev for one package/version and print the raw response JSON."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ecosystem", required=True)
+    parser.add_argument("--package", required=True, dest="package_name")
+    parser.add_argument("--version", default="")
+    args = parser.parse_args()
+
+    payload = {
+        "package": {
+            "name": args.package_name,
+            "ecosystem": args.ecosystem,
+        }
+    }
+    if args.version:
+        payload["version"] = args.version
+
+    request = urllib.request.Request(
+        "https://api.osv.dev/v1/query",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            sys.stdout.write(response.read().decode())
+            sys.stdout.write("\n")
+    except urllib.error.HTTPError as exc:
+        sys.stderr.write(exc.read().decode() or str(exc))
+        sys.stderr.write("\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
